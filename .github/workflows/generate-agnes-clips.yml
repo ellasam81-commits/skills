@@ -1,0 +1,97 @@
+name: Generate Agnes clips
+'on':
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: JSON with shots (shot, seconds, first_frame, prompt). Maximum
+          60 seconds.
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: agnes-video-generation
+  cancel-in-progress: false
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - name: Generate requested clips
+      env:
+        AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+        PLAN_JSON: ${{ inputs.plan }}
+      shell: python
+      run: "import json\nimport os\nimport sys\nimport time\nimport urllib.error\n\
+        import urllib.parse\nimport urllib.request\nfrom pathlib import Path\n\nMODEL\
+        \ = 'agnes-video-2.5-flash'\nBASE = 'https://apihub.agnes-ai.com'\nOUT = Path('agnes-clips')\n\
+        OUT.mkdir(exist_ok=True)\nkey = os.environ.get('AGNES_API_KEY', '').strip()\n\
+        if not key:\n    sys.exit('Missing AGNES_API_KEY repository secret.')\n\n\
+        class NoRedirect(urllib.request.HTTPRedirectHandler):\n    def redirect_request(self,\
+        \ req, fp, code, msg, headers, newurl):\n        return None\n\nopener = urllib.request.build_opener(NoRedirect)\n\
+        \ndef api(path, payload=None):\n    data = json.dumps(payload).encode() if\
+        \ payload is not None else None\n    request = urllib.request.Request(\n \
+        \       BASE + path, data=data,\n        headers={'Authorization': 'Bearer\
+        \ ' + key, 'Content-Type': 'application/json'},\n    )\n    for attempt in\
+        \ range(6):\n        try:\n            with opener.open(request, timeout=60)\
+        \ as response:\n                return json.load(response)\n        except\
+        \ urllib.error.HTTPError as error:\n            status = error.code\n    \
+        \        error.close()\n            # A rejected rate-limited request has\
+        \ not started a generation.\n            # Do not replay uncertain creation\
+        \ requests after network/server errors.\n            if status == 429 or (payload\
+        \ is None and status in {408, 500, 502, 503, 504, 520, 522, 524}):\n     \
+        \           if attempt < 5:\n                    time.sleep(min(2 ** (attempt\
+        \ + 1), 30))\n                    continue\n            raise RuntimeError(f'Agnes\
+        \ HTTP {status}; stopped without replaying the generation.') from None\n \
+        \       except (OSError, urllib.error.URLError):\n            raise RuntimeError('Network\
+        \ failure; stopped to avoid submitting a duplicate generation.') from None\n\
+        \    raise RuntimeError('Agnes request failed.')\n\nplan = json.loads(os.environ['PLAN_JSON'])\n\
+        shots = plan['shots']\nif not isinstance(shots, list) or not 1 <= len(shots)\
+        \ <= 12:\n    sys.exit('Expected 1 to 12 shots.')\nids = []\nfor shot in shots:\n\
+        \    number = shot['shot']\n    if type(number) is not int or not 1 <= number\
+        \ <= 99 or number in ids:\n        sys.exit('Shot numbers must be distinct\
+        \ integers from 1 to 99.')\n    ids.append(number)\n    if type(shot['seconds'])\
+        \ is not int or not 4 <= shot['seconds'] <= 12:\n        sys.exit('Each shot\
+        \ must be 4 to 12 seconds.')\n    url = urllib.parse.urlparse(shot['first_frame'])\n\
+        \    if url.scheme != 'https' or not url.hostname:\n        sys.exit('Each\
+        \ shot needs an HTTPS first-frame URL.')\n    if not isinstance(shot['prompt'],\
+        \ str) or not 1 <= len(shot['prompt']) <= 30000:\n        sys.exit('Missing\
+        \ or oversized shot prompt.')\nif sum(s['seconds'] for s in shots) > 60:\n\
+        \    sys.exit('At most 60 seconds per run.')\n\nmanifest = []\nmanifest_path\
+        \ = OUT / 'tasks.json'\ndef save():\n    manifest_path.write_text(json.dumps(manifest,\
+        \ ensure_ascii=False, indent=2))\n\nfor shot in shots:\n    number = shot['shot']\n\
+        \    print(f'Shot {number:02d}: submitting one {shot[\"seconds\"]}-second\
+        \ Flash clip.', flush=True)\n    result = api('/v1/videos', {\n        'model':\
+        \ MODEL, 'mode': 'keyframe', 'size': '720P',\n        'aspect_ratio': '16:9',\
+        \ 'seconds': str(shot['seconds']), 'n': 1,\n        'first_frame': shot['first_frame'],\
+        \ 'prompt': shot['prompt'],\n    })\n    video_id = result.get('video_id')\n\
+        \    if not video_id:\n        raise RuntimeError(f'Shot {number:02d}: creation\
+        \ response did not contain video_id; not resubmitting.')\n    record = {'shot':\
+        \ number, 'video_id': video_id, 'model_name': MODEL, 'status': result.get('status',\
+        \ 'pending')}\n    manifest.append(record)\n    save()\n    query = urllib.parse.urlencode({'video_id':\
+        \ video_id, 'model_name': MODEL})\n    deadline = time.monotonic() + 900\n\
+        \    while time.monotonic() < deadline:\n        result = api('/agnesapi?'\
+        \ + query)\n        record['status'] = result.get('status', 'unknown')\n \
+        \       save()\n        if record['status'] == 'completed':\n            video_url\
+        \ = result.get('url')\n            if not isinstance(video_url, str) or not\
+        \ video_url.startswith('https://'):\n                raise RuntimeError(f'Shot\
+        \ {number:02d}: completed task has no HTTPS video URL.')\n            record['url']\
+        \ = video_url\n            save()\n            # Download generated media\
+        \ without sending the Agnes API key.\n            with urllib.request.urlopen(video_url,\
+        \ timeout=120) as response:\n                with (OUT / f'shot-{number:02d}.mp4').open('wb')\
+        \ as stream:\n                    while block := response.read(1024 * 1024):\n\
+        \                        stream.write(block)\n            print(f'Shot {number:02d}:\
+        \ completed and downloaded.', flush=True)\n            break\n        if record['status']\
+        \ == 'failed':\n            raise RuntimeError(f'Shot {number:02d}: Agnes\
+        \ task failed; task ID is saved. No replacement was generated.')\n       \
+        \ time.sleep(5)\n    else:\n        raise RuntimeError(f'Shot {number:02d}:\
+        \ still pending after 15 minutes. Task ID saved; do not resubmit.')\n\nprint(f'Completed\
+        \ {len(shots)} clips. Download the agnes-clips artifact.', flush=True)\n"
+    - name: Save clips and task IDs
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: agnes-clips-${{ github.run_id }}
+        path: agnes-clips/
+        retention-days: 7
+        if-no-files-found: warn
