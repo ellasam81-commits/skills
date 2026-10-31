@@ -1,0 +1,85 @@
+name: Test Agnes API
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-connection:
+    name: Check Agnes connection
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Test the saved API key
+        env:
+          AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
+        shell: python
+        run: |
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          def fail(message):
+              print(f"::error::{message}")
+              raise SystemExit(1)
+
+          api_key = os.environ.get("AGNES_API_KEY", "").strip()
+          if not api_key:
+              fail("Missing AGNES_API_KEY. Add it under Settings > Secrets and variables > Actions.")
+
+          # Keep the secret on the fixed Agnes endpoint, including on redirects.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect)
+          payload = json.dumps({
+              "model": "agnes-2.5-flash",
+              "messages": [{"role": "user", "content": "Reply with OK."}],
+              "max_tokens": 32,
+              "stream": False,
+          }).encode("utf-8")
+          request = urllib.request.Request(
+              "https://apihub.agnes-ai.com/v1/chat/completions",
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          retryable = {408, 429, 500, 502, 503, 504, 520, 522, 524}
+          for attempt in range(3):
+              try:
+                  with opener.open(request, timeout=20) as response:
+                      result = json.load(response)
+                  break
+              except urllib.error.HTTPError as error:
+                  status = error.code
+                  error.close()
+                  if status in retryable and attempt < 2:
+                      print(f"Temporary HTTP {status}; retrying.")
+                      time.sleep(2 ** (attempt + 1))
+                      continue
+                  if status in {401, 403}:
+                      fail(f"Agnes returned HTTP {status}. Check the key and its API permissions.")
+                  fail(f"Agnes returned HTTP {status}. Check account limits or the Agnes service status.")
+              except (OSError, urllib.error.URLError):
+                  fail("Could not reach Agnes. Check service availability and try again.")
+              except (ValueError, UnicodeError):
+                  fail("Agnes returned an invalid JSON response.")
+
+          try:
+              content = result["choices"][0]["message"]["content"]
+              if not isinstance(content, str) or not content.strip():
+                  fail("Agnes returned no text. Check model availability and try again.")
+          except (KeyError, IndexError, TypeError):
+              fail("Agnes returned an unexpected response format.")
+
+          # Do not print the key, request headers, or raw API responses.
+          print("Success: Agnes accepted the saved API key and returned a text completion.")
